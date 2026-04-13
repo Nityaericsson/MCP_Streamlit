@@ -1,4 +1,10 @@
 --index-url https://pypi.org/simple
+--trusted-host pypi.org
+--trusted-host files.pythonhosted.org
+
+streamlit
+anthropic
+mcp
 annotated-doc==0.0.4
 annotated-types==0.7.0
 anyio==4.13.0
