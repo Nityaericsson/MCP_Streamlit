@@ -1,6 +1,6 @@
 streamlit==1.33.0
 httpx==0.27.0
 python-dotenv==1.0.1
-google-generativeai==0.8.6
+google-genai
 nest_asyncio==1.6.0
 mcp 
