@@ -4,6 +4,7 @@ from typing import Optional, Any
 from contextlib import AsyncExitStack
 from mcp import ClientSession, StdioServerParameters, types
 from mcp.client.stdio import stdio_client
+import json
 
 
 class MCPClient:
@@ -73,13 +74,40 @@ class MCPClient:
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self.cleanup()
 
-
+    
 # For testing
 async def main():
-    async with MCPClient(command="python", args=["mcp_server.py"]) as client:
-        tools = await client.list_tools()
-        print("Available tools:", [t.name for t in tools])
+    async with MCPClient(command="python", args=["mcp_server1.py"]) as places_client, \
+               MCPClient(command="python", args=["mcp_server2.py"]) as weather_client:
 
+        travel_type = "hill"
+
+        # Step 1 → MCP1
+        places_result = await places_client.call_tool(
+            "suggest_places",
+            {"preference": travel_type}
+        )
+
+        places_data = json.loads(places_result.content[0].text)
+        cities = places_data.get("places", [])
+
+        weather_data = []
+
+        # Step 2 → MCP2
+        for city in cities:
+            res = await weather_client.call_tool(
+                "get_weather",
+                {"city": city}
+            )
+
+            weather = json.loads(res.content[0].text)
+
+            weather_data.append({
+                "city": city,
+                "weather": weather
+            })
+
+        return str(weather_data)
 
 if __name__ == "__main__":
     if sys.platform == "win32":

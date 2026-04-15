@@ -4,9 +4,21 @@ from dotenv import load_dotenv
 
 from mcp_client import MCPClient
 from google import genai   # ✅ NEW SDK
+import json, re, httpx, os
 
 load_dotenv()
 
+async def resolve_symbol(company: str, api_key: str):
+    url = f"https://www.alphavantage.co/query?function=SYMBOL_SEARCH&keywords={company}&apikey={api_key}"
+
+    async with httpx.AsyncClient() as client:
+        res = await client.get(url)
+        data = res.json()
+
+    if "bestMatches" in data and len(data["bestMatches"]) > 0:
+        return data["bestMatches"][0]["1. symbol"]
+
+    return None
 
 class AIService:
     def __init__(self):
@@ -21,67 +33,85 @@ class AIService:
         self.model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
 
     async def process_query(self, user_input: str) -> str:
-        async with MCPClient(command=self.command, args=self.args) as client:
+        async with MCPClient("python", ["mcp_server1.py"]) as places_client, \
+           MCPClient("python", ["mcp_server2.py"]) as weather_client:
 
             try:
                 # -------------------------
                 # Step 1: Decide tool
                 # -------------------------
-                decision_prompt = f"""
-                User query: {user_input}
 
-                Classify into ONE of:
+# -------- STEP 1: Extract structured data --------
+                extraction_prompt = f"""
+                Analyze this query:
 
-                WEATHER → if question is about:
-                - rain
-                - temperature
-                - umbrella
-                - climate
-                - forecast
-                - hot/cold
-                - today weather
+                "{user_input}"
 
-                STOCK → if about stocks, price, market
+                Classify intent STRICTLY:
 
-                GENERAL → everything else
+                - WEATHER → asking about weather
+                - STOCK → asking about stocks
+                - TRAVEL → asking where to go / vacation / suggestions
+                - GENERAL → everything else
+                - suggested_city: city mentioned by user if any
 
-                Return ONLY:
-                WEATHER <lat> <lon>
-                OR
-                STOCK <symbol>
-                OR
-                GENERAL
+                For TRAVEL:
+                - ALWAYS assign a travel_type
+                - NEVER return null
+                - Choose the closest match:
+                - hill → for cool, pleasant, mountains
+                - beach → for hot, sunny, sea
+                - city → for urban travel
+                - general → if nothing fits
+
+                Return STRICT JSON:
+                {{
+                "intent": "...",
+                "location": "...",
+                "company_name": "...",
+                "stock_symbol": "...",
+                "travel_type": "..."
+                "suggested_city": "..."
+                }}
                 """
 
-                decision_res = self.client.models.generate_content(
+                res = self.client.models.generate_content(
                     model=self.model,
-                    contents=decision_prompt
+                    contents=extraction_prompt
                 )
 
-                decision = (decision_res.text or "").strip().upper()
+                # -------- SAFE JSON PARSE --------
+                json_text = re.search(r"\{.*\}", res.text, re.DOTALL).group()
+                data = json.loads(json_text)
 
-                # -------------------------
-                # Step 2: Route
-                print("🧠 Decision:", decision)
+                print("🧠 Parsed:", data)
 
-                print("🧠 Decision:", decision)
+                # -------- HELPER: resolve symbol --------
+                async def resolve_symbol(company: str):
+                    url = f"https://www.alphavantage.co/query?function=SYMBOL_SEARCH&keywords={company}&apikey={os.getenv('ALPHA_VANTAGE_KEY')}"
+                    
+                    async with httpx.AsyncClient() as client:
+                        res = await client.get(url)
+                        d = res.json()
 
-                if "WEATHER" in decision:
-                    print("🔧 USING MCP TOOL: WEATHER")
+                    if "bestMatches" in d and len(d["bestMatches"]) > 0:
+                        return d["bestMatches"][0]["1. symbol"]
 
-                elif "STOCK" in decision:
-                    print("🔧 USING MCP TOOL: STOCK")
+                    return None
 
-                else:
-                    print("🧠 USING GEMINI DIRECT")
-                # -------------------------
 
-                if "WEATHER" in decision:
-                    lat, lon = 12.97, 77.59  # Bangalore
+                # ================================
+                # WEATHER
+                # ================================
+                if data["intent"] == "WEATHER":
+                    location = data.get("location")
 
-                    result = await client.call_tool(
+                    if not location:
+                        return "❌ Please provide a valid city name."
+
+                    result = await weather_client.call_tool(
                         "get_weather",
-                        {"latitude": lat, "longitude": lon},
+                        {"city": location},
                     )
 
                     tool_data = result.content[0].text
@@ -91,20 +121,36 @@ class AIService:
                         contents=f"""
                         User question: {user_input}
 
+                        Location: {location}
+
                         Weather data:
                         {tool_data}
 
-                        Give a helpful, natural answer. Do NOT return JSON.
+                        Give a helpful, natural answer.
                         """
                     )
 
                     return final_res.text
 
-                elif "STOCK" in decision:
-                    parts = decision.split()
-                    symbol = parts[1] if len(parts) > 1 else "AAPL"
 
-                    result = await client.call_tool(
+                # ================================
+                # STOCK
+                # ================================
+                elif data["intent"] == "STOCK":
+
+                    company = data.get("company_name")
+                    llm_symbol = data.get("stock_symbol")
+
+                    symbol = await resolve_symbol(company)
+
+                    if not symbol:
+                        print("⚠️ API failed, using LLM fallback")
+                        symbol = llm_symbol
+
+                    if not symbol:
+                        return "❌ Could not find stock symbol."
+
+                    result = await weather_client.call_tool(
                         "get_stock_price",
                         {"symbol": symbol},
                     )
@@ -116,15 +162,123 @@ class AIService:
                         contents=f"""
                         User question: {user_input}
 
+                        Company: {company}
+                        Symbol: {symbol}
+
                         Stock data:
                         {tool_data}
 
-                        Explain the stock situation clearly in simple terms.
-                        Do NOT return raw JSON.
+                        Explain clearly in simple terms.
                         """
                     )
 
                     return final_res.text
+                
+                # ================================
+                # travel
+                # ================================
+
+                elif data["intent"] == "TRAVEL":
+                    travel_type = data.get("travel_type", "general")
+                    suggested_city = data.get("suggested_city")
+
+                    # -------------------------------
+                    # CASE 1: User gave a city
+                    # -------------------------------
+                    if suggested_city:
+
+                        # Step 1 → get weather
+                        res = await weather_client.call_tool(
+                            "get_weather",
+                            {"city": suggested_city}
+                        )
+
+                        try:
+                            weather = json.loads(res.content[0].text)
+                        except:
+                            return "❌ Could not fetch weather."
+
+                        # Step 2 → ask LLM to evaluate
+                        decision_prompt = f"""
+                        You are a travel expert.
+
+                        User wants to visit: {suggested_city}
+
+                        Current weather:
+                        {json.dumps(weather, indent=2)}
+
+                        Decide:
+                        - Is it a good time to visit?
+                        - If yes → explain why
+                        - If no → suggest 2–3 better similar places
+
+                        Return natural response (not JSON).
+                        """
+
+                        final = self.client.models.generate_content(
+                            model=self.model,
+                            contents=decision_prompt
+                        )
+
+                        return final.text
+
+                    # -------------------------------
+                    # CASE 2: No city → normal flow
+                    # -------------------------------
+
+                    places_result = await places_client.call_tool(
+                        "suggest_places",
+                        {"preference": travel_type}
+                    )
+
+                    places_data = json.loads(places_result.content[0].text)
+                    cities = places_data.get("places", [])
+
+                    weather_data = []
+
+                    for city in cities:
+                        res = await weather_client.call_tool(
+                            "get_weather",
+                            {"city": city}
+                        )
+
+                        try:
+                            weather = json.loads(res.content[0].text)
+                        except:
+                            continue
+
+                        weather_data.append({
+                            "city": city,
+                            "weather": weather
+                        })
+
+                    decision_prompt = f"""
+                    You are a travel expert.
+
+                    User query:
+                    {user_input}
+
+                    Data:
+                    {json.dumps(weather_data, indent=2)}
+
+                    Choose BEST city for vacation.
+
+                    Return JSON:
+                    {{
+                    "best_city": "...",
+                    "reason": "..."
+                    }}
+                    """
+
+                    final = self.client.models.generate_content(
+                        model=self.model,
+                        contents=decision_prompt
+                    )
+
+                    return final.text
+                # ================================
+                # GENERAL
+                # ================================
 
                 else:
                     res = self.client.models.generate_content(
@@ -133,6 +287,5 @@ class AIService:
                     )
 
                     return res.text or "No response generated."
-
             except Exception as e:
                 return f"❌ Error: {str(e)}"
