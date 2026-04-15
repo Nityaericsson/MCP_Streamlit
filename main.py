@@ -33,8 +33,8 @@ class AIService:
         self.model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
 
     async def process_query(self, user_input: str) -> str:
-        async with MCPClient("python", ["mcp_server1.py"]) as places_client, \
-           MCPClient("python", ["mcp_server2.py"]) as weather_client:
+        async with MCPClient(sys.executable, ["mcp_server1.py"]) as places_client, \
+           MCPClient(sys.executable, ["mcp_server2.py"]) as weather_client:
 
             try:
                 # -------------------------
